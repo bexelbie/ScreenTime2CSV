@@ -33,3 +33,9 @@ This command will export Screen Time data to output.csv using comma as the delim
 python3 screentime2csv.py -o output.tsv -d '\t'
 ```
 This command will export Screen Time data to output.tsv using tabs as the delimiter.
+
+The export keeps the original numeric timestamps, adds the raw Core Data
+timestamps, and renders ISO 8601 dates using each event's recorded GMT offset.
+`origin_status` identifies synced devices when the database provides a source.
+Current macOS versions store local events without a per-event device ID, so
+those rows are labeled as the local Mac using its model identifier.
