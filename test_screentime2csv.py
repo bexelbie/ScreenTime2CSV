@@ -113,6 +113,22 @@ class ScreenTime2CSVTests(unittest.TestCase):
 
         self.assertEqual(rows, [(648_000_000.0 + screentime2csv.CFA_EPOCH, "com.example.app")])
 
+    def test_parse_segb_page_ignores_marker_byte_too_close_to_eof_for_timestamp(self):
+        # A trailing 0x21 with fewer than 8 bytes left can't be validated as a
+        # real timestamp candidate, so it must be skipped, not raised on.
+        payload = b"SEGB" + encode_event(648_000_000.0, "com.example.app") + b"\x21\x01\x02\x03"
+
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.write(payload)
+            tmp = handle.name
+
+        try:
+            rows = list(screentime2csv.parse_segb_page(tmp))
+        finally:
+            os.unlink(tmp)
+
+        self.assertEqual(rows, [(648_000_000.0 + screentime2csv.CFA_EPOCH, "com.example.app")])
+
     def test_parse_segb_page_raises_on_truncated_event_candidate(self):
         payload = encode_structured_page(
             [(648_000_000.0, "com.example.app")],

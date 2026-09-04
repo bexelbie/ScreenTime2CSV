@@ -366,8 +366,13 @@ def parse_segb_page(path):
             cursor += 1
             continue
 
+        # ponytail: a 0x21 byte this close to EOF can't even be checked
+        # against a real timestamp yet, so it's an unverified false positive
+        # (same as any other mismatch below) rather than proof of corruption;
+        # skip it instead of aborting the whole page.
         if cursor + 9 > len(data):
-            raise RuntimeError(f"malformed Biome page {path}: truncated field-4/fixed64 candidate at offset {cursor}")
+            cursor += 1
+            continue
 
         try:
             ts_cfa = struct.unpack_from("<d", data, cursor + 1)[0]
