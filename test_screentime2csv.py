@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import io
 import os
 import sqlite3
@@ -252,6 +253,386 @@ class ScreenTime2CSVTests(unittest.TestCase):
             self.assertTrue(all(row["origin_status"].startswith(f"local/current Mac ({expected_model})") for row in rows))
         finally:
             os.unlink(db_path)
+
+    def test_load_knowledgec_hardware_models_maps_rapport_ids_and_uses_latest_seen_date(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            db_path = handle.name
+
+        try:
+            with sqlite3.connect(f"file:{db_path}?mode=rwc", uri=True) as con:
+                con.execute("CREATE TABLE ZSYNCPEER (ZRAPPORTID TEXT, ZMODEL TEXT, ZLASTSEENDATE REAL, Z_PK INTEGER)")
+                con.execute(
+                    "INSERT INTO ZSYNCPEER (ZRAPPORTID, ZMODEL, ZLASTSEENDATE, Z_PK) VALUES (?, ?, ?, ?)",
+                    ("F03C123", "iPhone14,2", 1_700_000_000.0, 1),
+                )
+                con.execute(
+                    "INSERT INTO ZSYNCPEER (ZRAPPORTID, ZMODEL, ZLASTSEENDATE, Z_PK) VALUES (?, ?, ?, ?)",
+                    ("F03C123", "iPhone14,1", 1_800_000_000.0, 2),
+                )
+                con.execute(
+                    "INSERT INTO ZSYNCPEER (ZRAPPORTID, ZMODEL, ZLASTSEENDATE, Z_PK) VALUES (?, ?, ?, ?)",
+                    ("missing", None, 1_600_000_000.0, 3),
+                )
+                con.execute(
+                    "INSERT INTO ZSYNCPEER (ZRAPPORTID, ZMODEL, ZLASTSEENDATE, Z_PK) VALUES (?, ?, ?, ?)",
+                    ("", "iPhone15,4", 1_900_000_000.0, 4),
+                )
+                con.execute(
+                    "INSERT INTO ZSYNCPEER (ZRAPPORTID, ZMODEL, ZLASTSEENDATE, Z_PK) VALUES (?, ?, ?, ?)",
+                    ("NULLID", "iPad14,8", None, 5),
+                )
+                con.commit()
+
+            old_db = screentime2csv.KNOWLEDGE_DB
+            screentime2csv.KNOWLEDGE_DB = db_path
+            try:
+                models = screentime2csv.load_knowledgec_hardware_models()
+            finally:
+                screentime2csv.KNOWLEDGE_DB = old_db
+
+            self.assertEqual(models["F03C123"], "iPhone14,1")
+            self.assertNotIn("missing", models)
+            self.assertNotIn("", models)
+            self.assertEqual(models["NULLID"], "iPad14,8")
+        finally:
+            os.unlink(db_path)
+
+    def test_collect_biome_rows_enriches_device_model_from_rapport_ids(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stream_root = os.path.join(tmpdir, "Biome", "streams", "restricted", "App.InFocus")
+            remote_dir = os.path.join(stream_root, "remote", "A944123")
+            os.makedirs(remote_dir)
+            payload = b"SEGB" + encode_event(648_000_000.0, "com.example.app")
+            with open(os.path.join(remote_dir, "page.bin"), "wb") as handle:
+                handle.write(payload)
+
+            sync_db = os.path.join(tmpdir, "sync.db")
+            with sqlite3.connect(f"file:{sync_db}?mode=rwc", uri=True) as con:
+                con.execute("CREATE TABLE DevicePeer (device_identifier TEXT, ids_device_identifier TEXT, name TEXT, platform TEXT, model TEXT)")
+                con.execute(
+                    "INSERT INTO DevicePeer (device_identifier, ids_device_identifier, name, platform, model) VALUES (?, ?, ?, ?, ?)",
+                    ("A944123", "F03C123", "iPhone", "iOS", "23G83"),
+                )
+                con.commit()
+
+            knowledge_db = os.path.join(tmpdir, "knowledge.db")
+            with sqlite3.connect(f"file:{knowledge_db}?mode=rwc", uri=True) as con:
+                con.execute("CREATE TABLE ZSYNCPEER (ZRAPPORTID TEXT, ZMODEL TEXT, ZLASTSEENDATE REAL, Z_PK INTEGER)")
+                con.execute(
+                    "INSERT INTO ZSYNCPEER (ZRAPPORTID, ZMODEL, ZLASTSEENDATE, Z_PK) VALUES (?, ?, ?, ?)",
+                    ("F03C123", "iPhone14,2", 1_700_000_000.0, 7),
+                )
+                con.commit()
+
+            old_biome_base = screentime2csv.BIOME_BASE
+            old_sync_db = screentime2csv.BIOME_SYNC_DB
+            old_knowledge_db = screentime2csv.KNOWLEDGE_DB
+            screentime2csv.BIOME_BASE = os.path.join(tmpdir, "Biome", "streams", "restricted")
+            screentime2csv.BIOME_SYNC_DB = sync_db
+            screentime2csv.KNOWLEDGE_DB = knowledge_db
+            try:
+                rows = screentime2csv.collect_biome_rows(
+                    "App.InFocus",
+                    0,
+                    hardware_models=screentime2csv.load_knowledgec_hardware_models(),
+                )
+            finally:
+                screentime2csv.BIOME_BASE = old_biome_base
+                screentime2csv.BIOME_SYNC_DB = old_sync_db
+                screentime2csv.KNOWLEDGE_DB = old_knowledge_db
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["device_model"], "iPhone14,2")
+            self.assertEqual(rows[0]["peer_model"], "23G83")
+
+    def test_collect_biome_rows_leaves_blank_model_when_rapport_id_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stream_root = os.path.join(tmpdir, "Biome", "streams", "restricted", "App.InFocus")
+            remote_dir = os.path.join(stream_root, "remote", "9001")
+            os.makedirs(remote_dir)
+            payload = b"SEGB" + encode_event(648_000_000.0, "com.example.app")
+            with open(os.path.join(remote_dir, "page.bin"), "wb") as handle:
+                handle.write(payload)
+
+            sync_db = os.path.join(tmpdir, "sync.db")
+            with sqlite3.connect(f"file:{sync_db}?mode=rwc", uri=True) as con:
+                con.execute("CREATE TABLE DevicePeer (device_identifier TEXT, ids_device_identifier TEXT, name TEXT, platform TEXT, model TEXT)")
+                con.execute(
+                    "INSERT INTO DevicePeer (device_identifier, ids_device_identifier, name, platform, model) VALUES (?, ?, ?, ?, ?)",
+                    ("9001", "01FNOTFOUND", "iPad", "iOS", "23G71"),
+                )
+                con.commit()
+
+            old_biome_base = screentime2csv.BIOME_BASE
+            old_sync_db = screentime2csv.BIOME_SYNC_DB
+            screentime2csv.BIOME_BASE = os.path.join(tmpdir, "Biome", "streams", "restricted")
+            screentime2csv.BIOME_SYNC_DB = sync_db
+            try:
+                rows = screentime2csv.collect_biome_rows("App.InFocus", 0, hardware_models={})
+            finally:
+                screentime2csv.BIOME_BASE = old_biome_base
+                screentime2csv.BIOME_SYNC_DB = old_sync_db
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["device_model"], "")
+            self.assertEqual(rows[0]["peer_model"], "23G71")
+
+    def test_load_knowledgec_hardware_models_ignores_blank_newer_model_for_same_rapport(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            db_path = handle.name
+
+        try:
+            with sqlite3.connect(f"file:{db_path}?mode=rwc", uri=True) as con:
+                con.execute("CREATE TABLE ZSYNCPEER (ZRAPPORTID TEXT, ZMODEL TEXT, ZLASTSEENDATE REAL, Z_PK INTEGER)")
+                con.execute(
+                    "INSERT INTO ZSYNCPEER (ZRAPPORTID, ZMODEL, ZLASTSEENDATE, Z_PK) VALUES (?, ?, ?, ?)",
+                    ("A1", "iPhone14,2", 1_700_000_000.0, 1),
+                )
+                con.execute(
+                    "INSERT INTO ZSYNCPEER (ZRAPPORTID, ZMODEL, ZLASTSEENDATE, Z_PK) VALUES (?, ?, ?, ?)",
+                    ("A1", "", 1_800_000_000.0, 2),
+                )
+                con.execute(
+                    "INSERT INTO ZSYNCPEER (ZRAPPORTID, ZMODEL, ZLASTSEENDATE, Z_PK) VALUES (?, ?, ?, ?)",
+                    ("A1", "iPhone14,1", None, 3),
+                )
+                con.commit()
+
+            old_db = screentime2csv.KNOWLEDGE_DB
+            screentime2csv.KNOWLEDGE_DB = db_path
+            try:
+                models = screentime2csv.load_knowledgec_hardware_models()
+            finally:
+                screentime2csv.KNOWLEDGE_DB = old_db
+
+            self.assertNotIn("A1", models)
+        finally:
+            os.unlink(db_path)
+
+    def test_load_knowledgec_hardware_models_ignores_conflicting_same_date_models(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            db_path = handle.name
+
+        try:
+            with sqlite3.connect(f"file:{db_path}?mode=rwc", uri=True) as con:
+                con.execute("CREATE TABLE ZSYNCPEER (ZRAPPORTID TEXT, ZMODEL TEXT, ZLASTSEENDATE REAL, Z_PK INTEGER)")
+                con.execute(
+                    "INSERT INTO ZSYNCPEER (ZRAPPORTID, ZMODEL, ZLASTSEENDATE, Z_PK) VALUES (?, ?, ?, ?)",
+                    ("A2", "iPhone14,2", 1_700_000_000.0, 1),
+                )
+                con.execute(
+                    "INSERT INTO ZSYNCPEER (ZRAPPORTID, ZMODEL, ZLASTSEENDATE, Z_PK) VALUES (?, ?, ?, ?)",
+                    ("A2", "iPad14,8", 1_700_000_000.0, 2),
+                )
+                con.commit()
+
+            old_db = screentime2csv.KNOWLEDGE_DB
+            screentime2csv.KNOWLEDGE_DB = db_path
+            try:
+                models = screentime2csv.load_knowledgec_hardware_models()
+            finally:
+                screentime2csv.KNOWLEDGE_DB = old_db
+
+            self.assertNotIn("A2", models)
+        finally:
+            os.unlink(db_path)
+
+    def test_load_knowledgec_hardware_models_keeps_agreement_on_same_date(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            db_path = handle.name
+
+        try:
+            with sqlite3.connect(f"file:{db_path}?mode=rwc", uri=True) as con:
+                con.execute("CREATE TABLE ZSYNCPEER (ZRAPPORTID TEXT, ZMODEL TEXT, ZLASTSEENDATE REAL, Z_PK INTEGER)")
+                con.execute(
+                    "INSERT INTO ZSYNCPEER (ZRAPPORTID, ZMODEL, ZLASTSEENDATE, Z_PK) VALUES (?, ?, ?, ?)",
+                    ("A3", "iPhone14,2", 1_700_000_000.0, 1),
+                )
+                con.execute(
+                    "INSERT INTO ZSYNCPEER (ZRAPPORTID, ZMODEL, ZLASTSEENDATE, Z_PK) VALUES (?, ?, ?, ?)",
+                    ("A3", " iPhone14,2 ", 1_700_000_000.0, 2),
+                )
+                con.execute(
+                    "INSERT INTO ZSYNCPEER (ZRAPPORTID, ZMODEL, ZLASTSEENDATE, Z_PK) VALUES (?, ?, ?, ?)",
+                    ("A3", "", 1_700_000_000.0, 3),
+                )
+                con.commit()
+
+            old_db = screentime2csv.KNOWLEDGE_DB
+            screentime2csv.KNOWLEDGE_DB = db_path
+            try:
+                models = screentime2csv.load_knowledgec_hardware_models()
+            finally:
+                screentime2csv.KNOWLEDGE_DB = old_db
+
+            self.assertEqual(models["A3"], "iPhone14,2")
+        finally:
+            os.unlink(db_path)
+
+    def test_load_biome_peers_handles_legacy_devicepeer_without_ids_column(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            db_path = handle.name
+
+        try:
+            with sqlite3.connect(f"file:{db_path}?mode=rwc", uri=True) as con:
+                con.execute("CREATE TABLE DevicePeer (device_identifier TEXT, name TEXT, platform TEXT, model TEXT)")
+                con.execute(
+                    "INSERT INTO DevicePeer (device_identifier, name, platform, model) VALUES (?, ?, ?, ?)",
+                    ("9001", "iPad", "iOS", "23G71"),
+                )
+                con.commit()
+
+            old_db = screentime2csv.BIOME_SYNC_DB
+            screentime2csv.BIOME_SYNC_DB = db_path
+            try:
+                peers = screentime2csv.load_biome_peers()
+            finally:
+                screentime2csv.BIOME_SYNC_DB = old_db
+
+            self.assertEqual(peers["9001"]["peer_name"], "iPad")
+            self.assertEqual(peers["9001"]["ids_device_identifier"], "")
+        finally:
+            os.unlink(db_path)
+
+    def test_main_knowledge_only_legacy_zsyncpeer_schema_does_not_require_rapportid(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            knowledge_db = os.path.join(tmpdir, "knowledge.db")
+            with sqlite3.connect(f"file:{knowledge_db}?mode=rwc", uri=True) as con:
+                con.execute(
+                    "CREATE TABLE ZOBJECT (ZVALUESTRING TEXT, ZENDDATE REAL, ZSTARTDATE REAL, ZCREATIONDATE REAL, ZSECONDSFROMGMT INTEGER, ZSOURCE INTEGER, Z_PK INTEGER, ZUUID TEXT, ZSTREAMNAME TEXT)"
+                )
+                con.execute("CREATE TABLE ZSOURCE (Z_PK INTEGER, ZDEVICEID TEXT)")
+                con.execute("CREATE TABLE ZSYNCPEER (ZDEVICEID TEXT, ZMODEL TEXT)")
+                con.execute(
+                    "INSERT INTO ZOBJECT (ZVALUESTRING, ZENDDATE, ZSTARTDATE, ZCREATIONDATE, ZSECONDSFROMGMT, ZSOURCE, Z_PK, ZUUID, ZSTREAMNAME) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("com.example.app", 20.0, 0.0, 0.0, 0, 1, 1, "uuid-1", "/app/usage"),
+                )
+                con.execute(
+                    "INSERT INTO ZSOURCE (Z_PK, ZDEVICEID) VALUES (?, ?)",
+                    (1, "AAA"),
+                )
+                con.execute(
+                    "INSERT INTO ZSYNCPEER (ZDEVICEID, ZMODEL) VALUES (?, ?)",
+                    ("AAA", "iPhone14,2"),
+                )
+                con.commit()
+
+            output_path = os.path.join(tmpdir, "knowledge.csv")
+            old_knowledge_db = screentime2csv.KNOWLEDGE_DB
+            old_biome_base = screentime2csv.BIOME_BASE
+            old_biome_sync = screentime2csv.BIOME_SYNC_DB
+            screentime2csv.KNOWLEDGE_DB = knowledge_db
+            screentime2csv.BIOME_BASE = os.path.join(tmpdir, "Biome", "streams", "restricted")
+            screentime2csv.BIOME_SYNC_DB = os.path.join(tmpdir, "sync.db")
+            try:
+                screentime2csv.main(["--no-biome", "--output", output_path, "--since", "0"])
+            finally:
+                screentime2csv.KNOWLEDGE_DB = old_knowledge_db
+                screentime2csv.BIOME_BASE = old_biome_base
+                screentime2csv.BIOME_SYNC_DB = old_biome_sync
+
+            with open(output_path, newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["device_model"], "iPhone14,2")
+
+    def test_main_both_sources_missing_bridge_schema_keeps_export_and_blank_enrichment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            knowledge_db = os.path.join(tmpdir, "knowledge.db")
+            with sqlite3.connect(f"file:{knowledge_db}?mode=rwc", uri=True) as con:
+                con.execute(
+                    "CREATE TABLE ZOBJECT (ZVALUESTRING TEXT, ZENDDATE REAL, ZSTARTDATE REAL, ZCREATIONDATE REAL, ZSECONDSFROMGMT INTEGER, ZSOURCE INTEGER, Z_PK INTEGER, ZUUID TEXT, ZSTREAMNAME TEXT)"
+                )
+                con.execute("CREATE TABLE ZSOURCE (Z_PK INTEGER, ZDEVICEID TEXT)")
+                con.execute("CREATE TABLE ZSYNCPEER (ZDEVICEID TEXT, ZMODEL TEXT)")
+                con.execute(
+                    "INSERT INTO ZOBJECT (ZVALUESTRING, ZENDDATE, ZSTARTDATE, ZCREATIONDATE, ZSECONDSFROMGMT, ZSOURCE, Z_PK, ZUUID, ZSTREAMNAME) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("com.example.app", 20.0, 0.0, 0.0, 0, 1, 1, "uuid-1", "/app/usage"),
+                )
+                con.execute(
+                    "INSERT INTO ZSOURCE (Z_PK, ZDEVICEID) VALUES (?, ?)",
+                    (1, "AAA"),
+                )
+                con.execute(
+                    "INSERT INTO ZSYNCPEER (ZDEVICEID, ZMODEL) VALUES (?, ?)",
+                    ("AAA", "iPhone14,2"),
+                )
+                con.commit()
+
+            stream_root = os.path.join(tmpdir, "Biome", "streams", "restricted", "App.InFocus")
+            remote_dir = os.path.join(stream_root, "remote", "9001")
+            os.makedirs(remote_dir)
+            payload = b"SEGB" + encode_event(648_000_000.0, "com.biome.app")
+            with open(os.path.join(remote_dir, "page.bin"), "wb") as handle:
+                handle.write(payload)
+
+            sync_db = os.path.join(tmpdir, "sync.db")
+            with sqlite3.connect(f"file:{sync_db}?mode=rwc", uri=True) as con:
+                con.execute("CREATE TABLE DevicePeer (device_identifier TEXT, ids_device_identifier TEXT, name TEXT, platform TEXT, model TEXT)")
+                con.execute(
+                    "INSERT INTO DevicePeer (device_identifier, ids_device_identifier, name, platform, model) VALUES (?, ?, ?, ?, ?)",
+                    ("9001", "ABC123", "iPad", "iOS", "23G71"),
+                )
+                con.commit()
+
+            output_path = os.path.join(tmpdir, "combined.csv")
+            old_biome_base = screentime2csv.BIOME_BASE
+            old_sync_db = screentime2csv.BIOME_SYNC_DB
+            old_knowledge_db = screentime2csv.KNOWLEDGE_DB
+            screentime2csv.BIOME_BASE = os.path.join(tmpdir, "Biome", "streams", "restricted")
+            screentime2csv.BIOME_SYNC_DB = sync_db
+            screentime2csv.KNOWLEDGE_DB = knowledge_db
+            try:
+                screentime2csv.main(["--output", output_path, "--since", "0"])
+            finally:
+                screentime2csv.BIOME_BASE = old_biome_base
+                screentime2csv.BIOME_SYNC_DB = old_sync_db
+                screentime2csv.KNOWLEDGE_DB = old_knowledge_db
+
+            with open(output_path, newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+            self.assertTrue(any(row["app"] == "com.example.app" and row["device_model"] == "iPhone14,2" for row in rows))
+            self.assertTrue(any(row["app"] == "com.biome.app" and row["device_model"] == "" and row["peer_model"] == "23G71" for row in rows))
+
+    def test_main_no_knowledge_skips_missing_knowledgec_and_keeps_biome_peer_model(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stream_root = os.path.join(tmpdir, "Biome", "streams", "restricted", "App.InFocus")
+            remote_dir = os.path.join(stream_root, "remote", "9001")
+            os.makedirs(remote_dir)
+            payload = b"SEGB" + encode_event(648_000_000.0, "com.example.app")
+            with open(os.path.join(remote_dir, "page.bin"), "wb") as handle:
+                handle.write(payload)
+
+            sync_db = os.path.join(tmpdir, "sync.db")
+            with sqlite3.connect(f"file:{sync_db}?mode=rwc", uri=True) as con:
+                con.execute("CREATE TABLE DevicePeer (device_identifier TEXT, ids_device_identifier TEXT, name TEXT, platform TEXT, model TEXT)")
+                con.execute(
+                    "INSERT INTO DevicePeer (device_identifier, ids_device_identifier, name, platform, model) VALUES (?, ?, ?, ?, ?)",
+                    ("9001", "01FNOTFOUND", "iPad", "iOS", "23G71"),
+                )
+                con.commit()
+
+            output_path = os.path.join(tmpdir, "biome.csv")
+            old_biome_base = screentime2csv.BIOME_BASE
+            old_sync_db = screentime2csv.BIOME_SYNC_DB
+            old_knowledge_db = screentime2csv.KNOWLEDGE_DB
+            screentime2csv.BIOME_BASE = os.path.join(tmpdir, "Biome", "streams", "restricted")
+            screentime2csv.BIOME_SYNC_DB = sync_db
+            screentime2csv.KNOWLEDGE_DB = os.path.join(tmpdir, "missing-knowledge.db")
+            try:
+                screentime2csv.main(["--no-knowledge", "--output", output_path, "--since", "0"])
+            finally:
+                screentime2csv.BIOME_BASE = old_biome_base
+                screentime2csv.BIOME_SYNC_DB = old_sync_db
+                screentime2csv.KNOWLEDGE_DB = old_knowledge_db
+
+            with open(output_path, newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["device_model"], "")
+            self.assertEqual(rows[0]["peer_model"], "23G71")
 
     def test_write_csv_uses_atomic_replace(self):
         with tempfile.TemporaryDirectory() as tmpdir:

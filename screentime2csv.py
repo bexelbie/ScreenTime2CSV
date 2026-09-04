@@ -200,6 +200,112 @@ def query_knowledgec(since_ts, *, required=True):
     return rows
 
 
+def normalize_device_model(value):
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    return normalized.casefold()
+
+
+def knowledgec_hardware_bridge_supported(path=KNOWLEDGE_DB):
+    if not os.path.exists(path):
+        return False
+    if not os.access(path, os.R_OK):
+        return False
+
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as con:
+            columns = [row[1] for row in con.execute("PRAGMA table_info(ZSYNCPEER)")]
+    except sqlite3.Error:
+        return False
+
+    return "ZRAPPORTID" in columns and "ZMODEL" in columns and "ZLASTSEENDATE" in columns
+
+
+def biome_hardware_bridge_supported(path=BIOME_SYNC_DB):
+    if not os.path.exists(path):
+        return False
+    if not os.access(path, os.R_OK):
+        return False
+
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as con:
+            columns = [row[1] for row in con.execute("PRAGMA table_info(DevicePeer)")]
+    except sqlite3.Error:
+        return False
+
+    return "device_identifier" in columns and "ids_device_identifier" in columns
+
+
+def load_knowledgec_hardware_models(required=True):
+    if not os.path.exists(KNOWLEDGE_DB):
+        if not required:
+            return {}
+        raise FileNotFoundError(f"{KNOWLEDGE_DB} not found")
+    if not os.access(KNOWLEDGE_DB, os.R_OK):
+        if not required:
+            return {}
+        raise PermissionError(
+            f"{KNOWLEDGE_DB} is not readable — grant Full Disk Access to your terminal/Python and retry"
+        )
+
+    if not knowledgec_hardware_bridge_supported(KNOWLEDGE_DB):
+        return {}
+
+    hardware_by_rapport = defaultdict(list)
+    try:
+        with sqlite3.connect(f"file:{KNOWLEDGE_DB}?mode=ro", uri=True) as con:
+            for rapport_id, model, last_seen, _ in con.execute(
+                "SELECT ZRAPPORTID, ZMODEL, ZLASTSEENDATE, Z_PK FROM ZSYNCPEER"
+            ):
+                if rapport_id is None:
+                    continue
+
+                rapport_key = str(rapport_id).strip()
+                if not rapport_key:
+                    continue
+
+                model_value = str(model).strip() if model is not None else ""
+                normalized_model = normalize_device_model(model_value)
+                try:
+                    last_seen_value = float(last_seen) if last_seen not in (None, "") else float("-inf")
+                except (TypeError, ValueError):
+                    last_seen_value = float("-inf")
+
+                hardware_by_rapport[rapport_key].append(
+                    {
+                        "model": model_value,
+                        "normalized_model": normalized_model,
+                        "last_seen": last_seen_value,
+                    }
+                )
+    except sqlite3.Error as exc:
+        if "no such column" in str(exc).lower() or "no such table" in str(exc).lower():
+            return {}
+        raise RuntimeError(f"knowledgeC hardware mapping query failed for {KNOWLEDGE_DB}: {exc}") from exc
+
+    hardware_models = {}
+    for rapport_key, records in hardware_by_rapport.items():
+        if not records:
+            continue
+
+        newest_seen = max(record["last_seen"] for record in records)
+        newest_records = [record for record in records if record["last_seen"] == newest_seen]
+        nonblank_normalized = {record["normalized_model"] for record in newest_records if record["normalized_model"] is not None}
+        if len(nonblank_normalized) != 1:
+            continue
+
+        selected = next(iter(nonblank_normalized))
+        for record in newest_records:
+            if record["normalized_model"] == selected:
+                hardware_models[rapport_key] = record["model"]
+                break
+
+    return hardware_models
+
+
 def load_biome_peers():
     if not os.path.exists(BIOME_SYNC_DB):
         return {}
@@ -209,16 +315,36 @@ def load_biome_peers():
     peers = {}
     try:
         with sqlite3.connect(f"file:{BIOME_SYNC_DB}?mode=ro", uri=True) as con:
-            for device_identifier, name, platform, model in con.execute(
-                "SELECT device_identifier, name, platform, model FROM DevicePeer"
-            ):
-                peers[device_identifier] = {
-                    "peer_uuid": device_identifier or "",
-                    "peer_name": name or "",
-                    "peer_platform": platform if platform is not None else "",
-                    "peer_model": model or "",
+            columns = [row[1] for row in con.execute("PRAGMA table_info(DevicePeer)")]
+            if not columns or "device_identifier" not in columns:
+                return {}
+
+            select_columns = [
+                column_name for column_name in ("device_identifier", "ids_device_identifier", "name", "platform", "model") if column_name in columns
+            ]
+            if not select_columns:
+                return {}
+
+            for row in con.execute(f"SELECT {', '.join(select_columns)} FROM DevicePeer"):
+                values = dict(zip(select_columns, row))
+                device_identifier = values.get("device_identifier")
+                if device_identifier is None:
+                    continue
+
+                key = str(device_identifier).strip()
+                if not key:
+                    continue
+
+                peers[key] = {
+                    "peer_uuid": key,
+                    "peer_name": values.get("name") or "",
+                    "peer_platform": values.get("platform") if values.get("platform") is not None else "",
+                    "peer_model": values.get("model") or "",
+                    "ids_device_identifier": values.get("ids_device_identifier") or "",
                 }
     except sqlite3.Error as exc:
+        if "no such table" in str(exc).lower() or "no such column" in str(exc).lower():
+            return {}
         raise RuntimeError(f"could not read {BIOME_SYNC_DB}: {exc}") from exc
     return peers
 
@@ -345,7 +471,7 @@ def sessionize_biome_events(events, max_gap=DEFAULT_BIOME_MAX_GAP):
     return sessions
 
 
-def make_biome_row(app, start_time, end_time, peer_uuid="", peer_name="", peer_platform="", peer_model=""):
+def make_biome_row(app, start_time, end_time, peer_uuid="", peer_name="", peer_platform="", peer_model="", device_model=""):
     start_time = float(start_time)
     end_time = float(end_time)
     usage = max(end_time - start_time, 0.0)
@@ -360,7 +486,7 @@ def make_biome_row(app, start_time, end_time, peer_uuid="", peer_name="", peer_p
         "created_at": "",
         "tz": "",
         "device_id": "",
-        "device_model": "",
+        "device_model": device_model or "",
         "object_id": "",
         "event_uuid": "",
         "start_date_raw": raw_start,
@@ -379,7 +505,7 @@ def make_biome_row(app, start_time, end_time, peer_uuid="", peer_name="", peer_p
     }
 
 
-def collect_biome_rows(stream_name, since_ts, max_gap=DEFAULT_BIOME_MAX_GAP, include_local=False, *, required=True):
+def collect_biome_rows(stream_name, since_ts, max_gap=DEFAULT_BIOME_MAX_GAP, include_local=False, *, required=True, hardware_models=None):
     root = os.path.join(BIOME_BASE, stream_name)
     if not os.path.isdir(root):
         if not required:
@@ -426,11 +552,14 @@ def collect_biome_rows(stream_name, since_ts, max_gap=DEFAULT_BIOME_MAX_GAP, inc
                     by_peer[peer].append((ts, bundle))
 
     peers = load_biome_peers()
+    hardware_models = {} if hardware_models is None else hardware_models
     rows = []
     for peer, events in by_peer.items():
         if not events:
             continue
         peer_info = peers.get(peer, {})
+        peer_ids = (peer_info.get("ids_device_identifier") or "").strip()
+        device_model = hardware_models.get(peer_ids, "") if peer_ids else ""
         sessions = sessionize_biome_events(events, max_gap=max_gap)
         for session in sessions:
             rows.append(
@@ -442,6 +571,7 @@ def collect_biome_rows(stream_name, since_ts, max_gap=DEFAULT_BIOME_MAX_GAP, inc
                     peer_name=peer_info.get("peer_name", ""),
                     peer_platform=peer_info.get("peer_platform", ""),
                     peer_model=peer_info.get("peer_model", ""),
+                    device_model=device_model,
                 )
             )
 
@@ -509,8 +639,19 @@ def main(argv=None):
     since_ts = parse_since(args.since)
     try:
         rows = []
+        hardware_models = {}
         if not args.no_knowledge:
             rows.extend(query_knowledgec(since_ts, required=True))
+
+        should_load_bridge_models = (
+            not args.no_knowledge
+            and not args.no_biome
+            and knowledgec_hardware_bridge_supported(KNOWLEDGE_DB)
+            and biome_hardware_bridge_supported(BIOME_SYNC_DB)
+        )
+        if should_load_bridge_models:
+            hardware_models = load_knowledgec_hardware_models(required=True)
+
         if not args.no_biome:
             rows.extend(
                 collect_biome_rows(
@@ -519,6 +660,7 @@ def main(argv=None):
                     max_gap=args.biome_max_gap,
                     include_local=args.include_biome_local,
                     required=True,
+                    hardware_models=hardware_models,
                 )
             )
     except (FileNotFoundError, PermissionError, RuntimeError, OSError) as exc:

@@ -43,6 +43,9 @@ options:
 - Uses UTC for known Biome instants because Biome does not provide a timezone or created_at value.
 - Leaves unavailable Biome metadata blank instead of fabricating it.
 - Marks Biome durations as inferred sessions from point telemetry, not authoritative Screen Time usage intervals.
+- For Biome remote peers, resolves hardware identifiers with the exact local mapping chain `DevicePeer.device_identifier` -> `DevicePeer.ids_device_identifier` -> `knowledgeC.ZSYNCPEER.ZRAPPORTID` -> `knowledgeC.ZSYNCPEER.ZMODEL`. The CSV `device_model` field is populated with the hardware identifier such as `iPhone14,2` or `iPad14,8`, while `peer_model` remains the raw Biome `DevicePeer.model`/OS-build value such as `23G83` or `23G71`.
+- `--no-knowledge` skips this enrichment entirely, so Biome exports still work without knowledgeC and `device_model` may remain blank if no mapping is available.
+- Human-readable peer names can be blank on some devices; the export keeps the raw peer UUID, platform, and model fields rather than guessing a better name.
 - Writes a full snapshot when `-o` is supplied; it does not append incremental `.last` data.
 
 ## Example
